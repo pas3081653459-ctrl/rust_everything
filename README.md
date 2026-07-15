@@ -44,7 +44,7 @@ xcode-select --install
 进入项目目录：
 
 ```bash
-cd /Users/Zhuanz/work/everything
+cd /path/to/everything
 ```
 
 开发模式运行：
@@ -230,7 +230,7 @@ cargo bundle --release
 默认输出位置：
 
 ```text
-target/release/bundle/osx/Rust Everything.app
+target/release/bundle/osx/rust-everything.app
 ```
 
 对外分发时，还需要使用 Apple Developer ID 对应用签名，并通过 `notarytool` 完成
@@ -276,7 +276,7 @@ Install Rust from [rustup](https://rustup.rs/) if it is not already available.
 Enter the project directory:
 
 ```bash
-cd /Users/Zhuanz/work/everything
+cd /path/to/everything
 ```
 
 Run a development build:
@@ -477,7 +477,7 @@ cargo bundle --release
 The default output is:
 
 ```text
-target/release/bundle/osx/Rust Everything.app
+target/release/bundle/osx/rust-everything.app
 ```
 
 Public distribution additionally requires Developer ID signing and Apple
