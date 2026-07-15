@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -9,7 +10,7 @@ use rusqlite::{
 use crate::model::{EntryKind, FileRecord, SearchResult, SortField, SortSpec};
 use crate::search::{SearchMode, SearchQuery};
 
-const FTS_SCHEMA_VERSION: &str = "2";
+const DATABASE_SCHEMA_VERSION: &str = "3";
 
 pub(super) struct IndexDatabase {
     connection: Connection,
@@ -23,36 +24,19 @@ impl IndexDatabase {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
-             PRAGMA case_sensitive_like = ON;
-             CREATE TABLE IF NOT EXISTS entries (
-                 id          INTEGER PRIMARY KEY,
-                 path        TEXT NOT NULL UNIQUE,
-                 parent      TEXT NOT NULL,
-                 name        TEXT NOT NULL,
-                 name_lower  TEXT NOT NULL,
-                 path_lower  TEXT NOT NULL,
-                 extension   TEXT,
-                 kind        INTEGER NOT NULL,
-                 size        INTEGER,
-                 modified_at INTEGER,
-                 device_id   INTEGER NOT NULL,
-                 inode       INTEGER NOT NULL,
-                 hidden      INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent);
-             CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name_lower);
-             CREATE INDEX IF NOT EXISTS idx_entries_path_lower ON entries(path_lower);
-             CREATE INDEX IF NOT EXISTS idx_entries_extension ON entries(extension);
-             CREATE INDEX IF NOT EXISTS idx_entries_size ON entries(size);
-             CREATE INDEX IF NOT EXISTS idx_entries_modified ON entries(modified_at);
-             CREATE INDEX IF NOT EXISTS idx_entries_identity ON entries(device_id, inode);
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS settings (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
              );",
         )?;
         let mut database = Self { connection };
-        database.ensure_name_only_fts()?;
+        database.ensure_schema()?;
+        database.connection.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS removed_name_ids (
+                 id INTEGER PRIMARY KEY
+             ) WITHOUT ROWID;",
+        )?;
         Ok(database)
     }
 
@@ -62,7 +46,7 @@ impl IndexDatabase {
         connection.execute_batch(
             "PRAGMA temp_store = MEMORY;
              PRAGMA busy_timeout = 1000;
-             PRAGMA case_sensitive_like = ON;
+             PRAGMA foreign_keys = ON;
              PRAGMA query_only = ON;",
         )?;
         Ok(Self { connection })
@@ -72,73 +56,135 @@ impl IndexDatabase {
         self.connection.get_interrupt_handle()
     }
 
-    fn ensure_name_only_fts(&mut self) -> Result<()> {
-        let current_schema: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entries_fts'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let recreate_fts = current_schema
-            .as_deref()
-            .map(|schema| schema.contains("path_lower"))
-            .unwrap_or(true);
+    fn ensure_schema(&mut self) -> Result<()> {
+        let schema_version: Option<String> = self.setting("database_schema_version")?;
+        if schema_version.as_deref() == Some(DATABASE_SCHEMA_VERSION) {
+            self.create_schema_objects()?;
+            return Ok(());
+        }
 
+        // Version 3 deliberately rebuilds the index. Migrating millions of
+        // duplicated path/name rows in-place would temporarily require both
+        // schemas and substantially more disk space than a clean rescan.
         let transaction = self.connection.transaction()?;
         transaction.execute_batch(
             "DROP TRIGGER IF EXISTS entries_ai;
              DROP TRIGGER IF EXISTS entries_ad;
-             DROP TRIGGER IF EXISTS entries_au;",
-        )?;
-        if recreate_fts {
-            transaction.execute_batch(
-                "DROP TABLE IF EXISTS entries_fts;
-                 CREATE VIRTUAL TABLE entries_fts USING fts5(
-                     name_lower,
-                     content='entries',
-                     content_rowid='id',
-                     tokenize='trigram'
-                 );
-                 INSERT INTO entries_fts(entries_fts) VALUES ('rebuild');",
-            )?;
-        }
-        transaction.execute_batch(
-            "CREATE TRIGGER entries_ai AFTER INSERT ON entries BEGIN
-                 INSERT INTO entries_fts(rowid, name_lower)
+             DROP TRIGGER IF EXISTS entries_au;
+             DROP TRIGGER IF EXISTS names_ai;
+             DROP TRIGGER IF EXISTS names_ad;
+             DROP TRIGGER IF EXISTS names_au;
+             DROP TABLE IF EXISTS entries_fts;
+             DROP TABLE IF EXISTS names_fts;
+             DROP TABLE IF EXISTS entries;
+             DROP TABLE IF EXISTS names;
+             CREATE TABLE names (
+                 id          INTEGER PRIMARY KEY,
+                 name        TEXT NOT NULL UNIQUE,
+                 name_lower  TEXT NOT NULL,
+                 extension   TEXT
+             );
+             CREATE TABLE entries (
+                 id          INTEGER PRIMARY KEY,
+                 path        TEXT NOT NULL UNIQUE,
+                 parent_id   INTEGER REFERENCES entries(id) ON DELETE CASCADE,
+                 name_id     INTEGER NOT NULL REFERENCES names(id),
+                 kind        INTEGER NOT NULL,
+                 size        INTEGER,
+                 modified_at INTEGER,
+                 hidden      INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX idx_names_lower ON names(name_lower);
+             CREATE INDEX idx_names_extension ON names(extension);
+             CREATE INDEX idx_entries_parent ON entries(parent_id);
+             CREATE INDEX idx_entries_name ON entries(name_id);
+             CREATE INDEX idx_entries_path_nocase ON entries(path COLLATE NOCASE);
+             CREATE INDEX idx_entries_size ON entries(size);
+             CREATE INDEX idx_entries_modified ON entries(modified_at);
+             CREATE VIRTUAL TABLE names_fts USING fts5(
+                 name_lower,
+                 content='names',
+                 content_rowid='id',
+                 tokenize='trigram'
+             );
+             CREATE TRIGGER names_ai AFTER INSERT ON names BEGIN
+                 INSERT INTO names_fts(rowid, name_lower)
                  VALUES (new.id, new.name_lower);
              END;
-             CREATE TRIGGER entries_ad AFTER DELETE ON entries BEGIN
-                 INSERT INTO entries_fts(entries_fts, rowid, name_lower)
+             CREATE TRIGGER names_ad AFTER DELETE ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
                  VALUES ('delete', old.id, old.name_lower);
              END;
-             CREATE TRIGGER entries_au AFTER UPDATE ON entries BEGIN
-                 INSERT INTO entries_fts(entries_fts, rowid, name_lower)
+             CREATE TRIGGER names_au AFTER UPDATE OF name_lower ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
                  VALUES ('delete', old.id, old.name_lower);
-                 INSERT INTO entries_fts(rowid, name_lower)
+                 INSERT INTO names_fts(rowid, name_lower)
                  VALUES (new.id, new.name_lower);
-             END;",
-        )?;
-        transaction.execute(
-            "INSERT INTO settings(key, value) VALUES ('fts_schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [FTS_SCHEMA_VERSION],
+             END;
+             INSERT INTO settings(key, value) VALUES ('database_schema_version', '3')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             INSERT INTO settings(key, value) VALUES ('scan_complete', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             INSERT INTO settings(key, value) VALUES ('system_scan_complete', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             DELETE FROM settings WHERE key = 'fts_schema_version';",
         )?;
         transaction.commit()?;
         Ok(())
     }
 
+    fn create_schema_objects(&self) -> Result<()> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS names (
+                 id          INTEGER PRIMARY KEY,
+                 name        TEXT NOT NULL UNIQUE,
+                 name_lower  TEXT NOT NULL,
+                 extension   TEXT
+             );
+             CREATE TABLE IF NOT EXISTS entries (
+                 id          INTEGER PRIMARY KEY,
+                 path        TEXT NOT NULL UNIQUE,
+                 parent_id   INTEGER REFERENCES entries(id) ON DELETE CASCADE,
+                 name_id     INTEGER NOT NULL REFERENCES names(id),
+                 kind        INTEGER NOT NULL,
+                 size        INTEGER,
+                 modified_at INTEGER,
+                 hidden      INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_names_lower ON names(name_lower);
+             CREATE INDEX IF NOT EXISTS idx_names_extension ON names(extension);
+             CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent_id);
+             CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name_id);
+             CREATE INDEX IF NOT EXISTS idx_entries_path_nocase ON entries(path COLLATE NOCASE);
+             CREATE INDEX IF NOT EXISTS idx_entries_size ON entries(size);
+             CREATE INDEX IF NOT EXISTS idx_entries_modified ON entries(modified_at);
+             CREATE VIRTUAL TABLE IF NOT EXISTS names_fts USING fts5(
+                 name_lower,
+                 content='names',
+                 content_rowid='id',
+                 tokenize='trigram'
+             );
+             CREATE TRIGGER IF NOT EXISTS names_ai AFTER INSERT ON names BEGIN
+                 INSERT INTO names_fts(rowid, name_lower)
+                 VALUES (new.id, new.name_lower);
+             END;
+             CREATE TRIGGER IF NOT EXISTS names_ad AFTER DELETE ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
+                 VALUES ('delete', old.id, old.name_lower);
+             END;
+             CREATE TRIGGER IF NOT EXISTS names_au AFTER UPDATE OF name_lower ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
+                 VALUES ('delete', old.id, old.name_lower);
+                 INSERT INTO names_fts(rowid, name_lower)
+                 VALUES (new.id, new.name_lower);
+             END;",
+        )?;
+        Ok(())
+    }
+
     pub fn ensure_index_root(&mut self, root: &Path) -> Result<()> {
         let root = root.to_string_lossy();
-        let stored_root: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'index_root'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let stored_root = self.stored_index_root()?;
 
         if stored_root.as_deref() != Some(root.as_ref()) {
             self.clear()?;
@@ -148,19 +194,18 @@ impl IndexDatabase {
                 [root.as_ref()],
             )?;
             self.set_scan_complete(false)?;
+            self.set_include_system_files(false)?;
+            self.set_system_scan_complete(false)?;
         }
         Ok(())
     }
 
+    pub fn stored_index_root(&self) -> Result<Option<String>> {
+        self.setting("index_root")
+    }
+
     pub fn is_scan_complete(&self) -> Result<bool> {
-        let value: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'scan_complete'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let value = self.setting("scan_complete")?;
         Ok(value.as_deref() == Some("1"))
     }
 
@@ -169,6 +214,61 @@ impl IndexDatabase {
             "INSERT INTO settings(key, value) VALUES ('scan_complete', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [if complete { "1" } else { "0" }],
+        )?;
+        Ok(())
+    }
+
+    pub fn include_system_files(&self) -> Result<bool> {
+        self.bool_setting("include_system_files")
+    }
+
+    pub fn set_include_system_files(&self, include: bool) -> Result<()> {
+        self.set_bool_setting("include_system_files", include)
+    }
+
+    pub fn is_system_scan_complete(&self) -> Result<bool> {
+        self.bool_setting("system_scan_complete")
+    }
+
+    pub fn set_system_scan_complete(&self, complete: bool) -> Result<()> {
+        self.set_bool_setting("system_scan_complete", complete)
+    }
+
+    pub fn last_fsevent_id(&self) -> Result<Option<u64>> {
+        Ok(self
+            .setting("last_fsevent_id")?
+            .and_then(|value| value.parse().ok()))
+    }
+
+    pub fn set_last_fsevent_id(&self, event_id: u64) -> Result<()> {
+        self.set_setting("last_fsevent_id", &event_id.to_string())
+    }
+
+    fn bool_setting(&self, key: &str) -> Result<bool> {
+        let value = self.setting(key)?;
+        Ok(value.as_deref() == Some("1"))
+    }
+
+    fn set_bool_setting(&self, key: &str, value: bool) -> Result<()> {
+        self.set_setting(key, if value { "1" } else { "0" })
+    }
+
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
         )?;
         Ok(())
     }
@@ -183,23 +283,24 @@ impl IndexDatabase {
     pub fn clear(&mut self) -> Result<()> {
         let transaction = self.connection.transaction()?;
         transaction.execute_batch(
-            "DROP TRIGGER IF EXISTS entries_ai;
-             DROP TRIGGER IF EXISTS entries_ad;
-             DROP TRIGGER IF EXISTS entries_au;
-             INSERT INTO entries_fts(entries_fts) VALUES ('delete-all');
+            "DROP TRIGGER IF EXISTS names_ai;
+             DROP TRIGGER IF EXISTS names_ad;
+             DROP TRIGGER IF EXISTS names_au;
+             INSERT INTO names_fts(names_fts) VALUES ('delete-all');
              DELETE FROM entries;
-             CREATE TRIGGER entries_ai AFTER INSERT ON entries BEGIN
-                 INSERT INTO entries_fts(rowid, name_lower)
+             DELETE FROM names;
+             CREATE TRIGGER names_ai AFTER INSERT ON names BEGIN
+                 INSERT INTO names_fts(rowid, name_lower)
                  VALUES (new.id, new.name_lower);
              END;
-             CREATE TRIGGER entries_ad AFTER DELETE ON entries BEGIN
-                 INSERT INTO entries_fts(entries_fts, rowid, name_lower)
+             CREATE TRIGGER names_ad AFTER DELETE ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
                  VALUES ('delete', old.id, old.name_lower);
              END;
-             CREATE TRIGGER entries_au AFTER UPDATE ON entries BEGIN
-                 INSERT INTO entries_fts(entries_fts, rowid, name_lower)
+             CREATE TRIGGER names_au AFTER UPDATE OF name_lower ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
                  VALUES ('delete', old.id, old.name_lower);
-                 INSERT INTO entries_fts(rowid, name_lower)
+                 INSERT INTO names_fts(rowid, name_lower)
                  VALUES (new.id, new.name_lower);
              END;",
         )?;
@@ -207,57 +308,193 @@ impl IndexDatabase {
         Ok(())
     }
 
-    pub fn upsert_batch(&mut self, records: &[FileRecord]) -> Result<()> {
+    pub fn retain_path_tree(&mut self, root: &Path) -> Result<()> {
+        let root = root.to_string_lossy();
+        let prefix = format!("{}/", root.trim_end_matches('/'));
         let transaction = self.connection.transaction()?;
-        {
-            let mut statement = transaction.prepare_cached(
-                "INSERT INTO entries (
-                    path, parent, name, name_lower, path_lower, extension, kind,
-                    size, modified_at, device_id, inode, hidden
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT(path) DO UPDATE SET
-                    parent = excluded.parent,
-                    name = excluded.name,
-                    name_lower = excluded.name_lower,
-                    path_lower = excluded.path_lower,
-                    extension = excluded.extension,
-                    kind = excluded.kind,
-                    size = excluded.size,
-                    modified_at = excluded.modified_at,
-                    device_id = excluded.device_id,
-                    inode = excluded.inode,
-                    hidden = excluded.hidden",
-            )?;
-
-            for record in records {
-                statement.execute(params![
-                    record.path,
-                    record.parent,
-                    record.name,
-                    record.name_lower,
-                    record.path_lower,
-                    record.extension,
-                    record.kind.as_i64(),
-                    record.size,
-                    record.modified_at,
-                    record.device_id,
-                    record.inode,
-                    record.hidden,
-                ])?;
-            }
-        }
+        transaction.execute_batch(
+            "DROP TRIGGER IF EXISTS names_ai;
+             DROP TRIGGER IF EXISTS names_ad;
+             DROP TRIGGER IF EXISTS names_au;",
+        )?;
+        transaction.execute(
+            "DELETE FROM entries
+             WHERE path != ?1
+               AND substr(path, 1, length(?2)) != ?2",
+            params![root.as_ref(), prefix],
+        )?;
+        transaction.execute(
+            "DELETE FROM names
+             WHERE NOT EXISTS (SELECT 1 FROM entries WHERE entries.name_id = names.id)",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT INTO names_fts(names_fts) VALUES ('rebuild')",
+            [],
+        )?;
+        transaction.execute_batch(
+            "INSERT INTO settings(key, value) VALUES ('include_system_files', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             INSERT INTO settings(key, value) VALUES ('system_scan_complete', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+        )?;
+        transaction.execute_batch(
+            "CREATE TRIGGER names_ai AFTER INSERT ON names BEGIN
+                 INSERT INTO names_fts(rowid, name_lower)
+                 VALUES (new.id, new.name_lower);
+             END;
+             CREATE TRIGGER names_ad AFTER DELETE ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
+                 VALUES ('delete', old.id, old.name_lower);
+             END;
+             CREATE TRIGGER names_au AFTER UPDATE OF name_lower ON names BEGIN
+                 INSERT INTO names_fts(names_fts, rowid, name_lower)
+                 VALUES ('delete', old.id, old.name_lower);
+                 INSERT INTO names_fts(rowid, name_lower)
+                 VALUES (new.id, new.name_lower);
+             END;",
+        )?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub fn remove_path_tree(&mut self, path: &Path) -> Result<()> {
+    pub fn upsert_batch(&mut self, records: &[FileRecord]) -> Result<u64> {
+        let transaction = self.connection.transaction()?;
+        let mut inserted_count = 0_u64;
+        {
+            let mut insert_name = transaction.prepare_cached(
+                "INSERT INTO names(name, name_lower, extension)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO NOTHING",
+            )?;
+            let mut select_name =
+                transaction.prepare_cached("SELECT id FROM names WHERE name = ?1")?;
+            let mut select_parent =
+                transaction.prepare_cached("SELECT id FROM entries WHERE path = ?1")?;
+            let mut insert_entry = transaction.prepare_cached(
+                "INSERT INTO entries (
+                    path, parent_id, name_id, kind, size, modified_at, hidden
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO NOTHING",
+            )?;
+            let mut update_entry = transaction.prepare_cached(
+                "UPDATE entries SET
+                    parent_id = ?2,
+                    name_id = ?3,
+                    kind = ?4,
+                    size = ?5,
+                    modified_at = ?6,
+                    hidden = ?7
+                 WHERE path = ?1",
+            )?;
+            let mut name_ids = HashMap::<&str, i64>::new();
+
+            for record in records {
+                let name_id = if let Some(id) = name_ids.get(record.name.as_str()) {
+                    *id
+                } else {
+                    insert_name.execute(params![
+                        record.name,
+                        record.name_lower,
+                        record.extension,
+                    ])?;
+                    let id = select_name.query_row([record.name.as_str()], |row| row.get(0))?;
+                    name_ids.insert(record.name.as_str(), id);
+                    id
+                };
+                let parent_id = if record.parent.is_empty() {
+                    None
+                } else {
+                    select_parent
+                        .query_row([record.parent.as_str()], |row| row.get::<_, i64>(0))
+                        .optional()?
+                };
+                let inserted = insert_entry.execute(params![
+                    record.path,
+                    parent_id,
+                    name_id,
+                    record.kind.as_i64(),
+                    record.size,
+                    record.modified_at,
+                    record.hidden,
+                ])?;
+                if inserted == 0 {
+                    update_entry.execute(params![
+                        record.path,
+                        parent_id,
+                        name_id,
+                        record.kind.as_i64(),
+                        record.size,
+                        record.modified_at,
+                        record.hidden,
+                    ])?;
+                } else {
+                    inserted_count = inserted_count.saturating_add(inserted as u64);
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted_count)
+    }
+
+    pub fn remove_path_tree(&mut self, path: &Path) -> Result<u64> {
         let path = path.to_string_lossy();
-        let prefix = format!("{}/%", escape_like(&path));
-        self.connection.execute(
-            "DELETE FROM entries WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-            params![path.as_ref(), prefix],
+        let trimmed_path = path.trim_end_matches('/');
+        let prefix = format!("{trimmed_path}/");
+        // SQLite's default BINARY collation compares UTF-8 bytes. Replacing
+        // the trailing slash with the next ASCII byte gives an exclusive
+        // upper bound for every descendant path while keeping the path index
+        // usable: `/a/` <= descendants < `/a0`.
+        let upper_bound = format!("{trimmed_path}0");
+        let transaction = self.connection.transaction()?;
+
+        transaction.execute("DELETE FROM temp.removed_name_ids", [])?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO temp.removed_name_ids(id)
+             SELECT name_id FROM entries WHERE path = ?1",
+            [path.as_ref()],
         )?;
-        Ok(())
+        transaction.execute(
+            "INSERT OR IGNORE INTO temp.removed_name_ids(id)
+             SELECT name_id FROM entries
+             WHERE path >= ?2 AND path < ?3 AND path != ?1",
+            params![path.as_ref(), prefix, upper_bound],
+        )?;
+        let exact_removed = transaction.query_row(
+            "SELECT count(*) FROM entries WHERE path = ?1",
+            [path.as_ref()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let descendant_removed = transaction.query_row(
+            "SELECT count(*) FROM entries
+             WHERE path >= ?2 AND path < ?3 AND path != ?1",
+            params![path.as_ref(), prefix, upper_bound],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let removed = exact_removed.saturating_add(descendant_removed);
+        transaction.execute(
+            "DELETE FROM entries WHERE path = ?1",
+            [path.as_ref()],
+        )?;
+        // The exact-path delete normally cascades through parent_id. The
+        // indexed range delete also removes any legacy/orphaned descendants
+        // whose parent_id could not be populated.
+        transaction.execute(
+            "DELETE FROM entries
+             WHERE path >= ?2 AND path < ?3 AND path != ?1",
+            params![path.as_ref(), prefix, upper_bound],
+        )?;
+        transaction.execute(
+            "DELETE FROM names
+             WHERE id IN (SELECT id FROM temp.removed_name_ids)
+               AND NOT EXISTS (
+                   SELECT 1 FROM entries WHERE entries.name_id = names.id
+               )",
+            [],
+        )?;
+        transaction.execute("DELETE FROM temp.removed_name_ids", [])?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     pub fn search(
@@ -299,14 +536,16 @@ impl IndexDatabase {
         let use_fts = !fts_terms.is_empty();
 
         let mut sql = if use_fts {
-            "SELECT e.path, e.name, e.kind, e.size, e.modified_at, e.hidden
-             FROM entries_fts
-             JOIN entries e ON e.id = entries_fts.rowid
-             WHERE entries_fts MATCH ?"
+            "SELECT e.path, n.name, e.kind, e.size, e.modified_at, e.hidden
+             FROM names_fts
+             JOIN names n ON n.id = names_fts.rowid
+             JOIN entries e ON e.name_id = n.id
+             WHERE names_fts MATCH ?"
                 .to_owned()
         } else {
-            "SELECT path, name, kind, size, modified_at, hidden
-             FROM entries
+            "SELECT e.path, n.name, e.kind, e.size, e.modified_at, e.hidden
+             FROM names n
+             JOIN entries e ON e.name_id = n.id
              WHERE 1 = 1"
                 .to_owned()
         };
@@ -321,47 +560,38 @@ impl IndexDatabase {
             parameters.push(Value::Text(expression));
         }
 
-        let column_prefix = if use_fts { "e." } else { "" };
         for term in query
             .terms
             .iter()
             .filter(|term| term.chars().count() < 3)
         {
-            sql.push_str(&format!(
-                " AND {column_prefix}name_lower LIKE ? ESCAPE '\\'"
-            ));
+            sql.push_str(" AND n.name_lower LIKE ? ESCAPE '\\'");
             parameters.push(Value::Text(format!("%{}%", escape_like(term))));
         }
         if let Some(path) = &query.path {
             if query.path_is_anchored {
-                sql.push_str(&format!(
-                    " AND {column_prefix}path_lower LIKE ? ESCAPE '\\'"
-                ));
+                sql.push_str(" AND e.path COLLATE NOCASE LIKE ? ESCAPE '\\'");
                 parameters.push(Value::Text(format!("{}%", escape_like(path))));
             } else {
-                sql.push_str(&format!(
-                    " AND {column_prefix}path_lower LIKE ? ESCAPE '\\'"
-                ));
+                sql.push_str(" AND e.path COLLATE NOCASE LIKE ? ESCAPE '\\'");
                 parameters.push(Value::Text(format!("%{}%", escape_like(path))));
             }
         }
         if let Some(extension) = &query.extension {
-            sql.push_str(&format!(" AND {column_prefix}extension = ?"));
+            sql.push_str(" AND n.extension = ?");
             parameters.push(Value::Text(extension.clone()));
         }
         if let Some(kind) = query.kind {
-            sql.push_str(&format!(" AND {column_prefix}kind = ?"));
+            sql.push_str(" AND e.kind = ?");
             parameters.push(Value::Integer(kind.as_i64()));
         }
         for excluded in &query.excluded {
-            sql.push_str(&format!(
-                " AND {column_prefix}name_lower NOT LIKE ? ESCAPE '\\'"
-            ));
+            sql.push_str(" AND n.name_lower NOT LIKE ? ESCAPE '\\'");
             parameters.push(Value::Text(format!("%{}%", escape_like(excluded))));
         }
         if !has_linear_filter {
             sql.push(' ');
-            sql.push_str(sql_order_by(sort, use_fts));
+            sql.push_str(sql_order_by(sort));
         }
         sql.push_str(" LIMIT ?");
         parameters.push(Value::Integer(candidate_limit));
@@ -393,36 +623,21 @@ impl IndexDatabase {
     }
 }
 
-fn sql_order_by(sort: SortSpec, fts_query: bool) -> &'static str {
-    let prefix = if fts_query { "e." } else { "" };
-    match (sort.field, sort.ascending, prefix) {
-        (SortField::Name, true, "e.") => "ORDER BY e.name_lower ASC, e.path_lower ASC",
-        (SortField::Name, false, "e.") => "ORDER BY e.name_lower DESC, e.path_lower DESC",
-        (SortField::Size, true, "e.") => {
-            "ORDER BY e.size IS NULL ASC, e.size ASC, e.name_lower ASC"
+fn sql_order_by(sort: SortSpec) -> &'static str {
+    match (sort.field, sort.ascending) {
+        (SortField::Name, true) => "ORDER BY n.name_lower ASC, e.path ASC",
+        (SortField::Name, false) => "ORDER BY n.name_lower DESC, e.path DESC",
+        (SortField::Size, true) => {
+            "ORDER BY e.size IS NULL ASC, e.size ASC, n.name_lower ASC"
         }
-        (SortField::Size, false, "e.") => {
-            "ORDER BY e.size IS NULL ASC, e.size DESC, e.name_lower ASC"
+        (SortField::Size, false) => {
+            "ORDER BY e.size IS NULL ASC, e.size DESC, n.name_lower ASC"
         }
-        (SortField::Modified, true, "e.") => {
-            "ORDER BY e.modified_at IS NULL ASC, e.modified_at ASC, e.name_lower ASC"
+        (SortField::Modified, true) => {
+            "ORDER BY e.modified_at IS NULL ASC, e.modified_at ASC, n.name_lower ASC"
         }
-        (SortField::Modified, false, "e.") => {
-            "ORDER BY e.modified_at IS NULL ASC, e.modified_at DESC, e.name_lower ASC"
-        }
-        (SortField::Name, true, _) => "ORDER BY name_lower ASC, path_lower ASC",
-        (SortField::Name, false, _) => "ORDER BY name_lower DESC, path_lower DESC",
-        (SortField::Size, true, _) => {
-            "ORDER BY size IS NULL ASC, size ASC, name_lower ASC"
-        }
-        (SortField::Size, false, _) => {
-            "ORDER BY size IS NULL ASC, size DESC, name_lower ASC"
-        }
-        (SortField::Modified, true, _) => {
-            "ORDER BY modified_at IS NULL ASC, modified_at ASC, name_lower ASC"
-        }
-        (SortField::Modified, false, _) => {
-            "ORDER BY modified_at IS NULL ASC, modified_at DESC, name_lower ASC"
+        (SortField::Modified, false) => {
+            "ORDER BY e.modified_at IS NULL ASC, e.modified_at DESC, n.name_lower ASC"
         }
     }
 }

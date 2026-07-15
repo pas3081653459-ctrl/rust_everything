@@ -14,12 +14,15 @@ use global_hotkey::{
     hotkey::{CMD_OR_CTRL, Code, HotKey},
 };
 
-use crate::index::{IndexEvent, IndexService};
+use crate::index::{IndexEvent, IndexService, ScanScope};
 use crate::model::{EntryKind, SearchResult, SortField, SortSpec};
 use crate::native_icon::NativeIconCache;
 use crate::platform;
+use crate::search::SearchQuery;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const INCREMENTAL_VERIFY_DELAY: Duration = Duration::from_millis(500);
+const INDEX_REFRESH_COALESCE: Duration = Duration::from_secs(5);
 const HEADER_HEIGHT: f32 = 32.0;
 const RESULT_ROW_HEIGHT: f32 = 30.0;
 const TYPE_WIDTH: f32 = 72.0;
@@ -311,8 +314,12 @@ pub struct SearchApp {
     scanning: bool,
     skipped: u64,
     status: String,
-    pending_search: Option<(Instant, u64)>,
+    pending_search: Option<(Instant, u64, bool)>,
     searching: bool,
+    search_cache_valid: bool,
+    results_stale: bool,
+    stale_refresh_due: Option<Instant>,
+    window_visible: bool,
     next_query_id: u64,
     latest_query_id: u64,
     show_hidden: bool,
@@ -324,6 +331,9 @@ pub struct SearchApp {
     focus_search_requested: bool,
     refocus_window_next_frame: bool,
     quit_requested: bool,
+    settings_open: bool,
+    include_system_files: bool,
+    settings_include_system_files: bool,
     native_icons: NativeIconCache,
 }
 
@@ -343,7 +353,7 @@ impl SearchApp {
             };
 
         Ok(Self {
-            status: format!("Opening global index for {}", index.root().display()),
+            status: format!("Opening user-file index for {}", index.root().display()),
             index,
             query: String::new(),
             results: Vec::new(),
@@ -353,6 +363,10 @@ impl SearchApp {
             skipped: 0,
             pending_search: None,
             searching: false,
+            search_cache_valid: false,
+            results_stale: false,
+            stale_refresh_due: None,
+            window_visible: true,
             next_query_id: 1,
             latest_query_id: 0,
             show_hidden: true,
@@ -364,6 +378,9 @@ impl SearchApp {
             focus_search_requested: true,
             refocus_window_next_frame: false,
             quit_requested: false,
+            settings_open: false,
+            include_system_files: false,
+            settings_include_system_files: false,
             native_icons: NativeIconCache::new(&creation_context.egui_ctx),
         })
     }
@@ -382,61 +399,107 @@ impl SearchApp {
                         "Discarding an incomplete index ({entries} entries)..."
                     );
                 }
-                IndexEvent::Ready { indexed, root } => {
+                IndexEvent::Ready {
+                    indexed,
+                    root,
+                    include_system_files,
+                } => {
                     self.indexed = indexed;
+                    self.include_system_files = include_system_files;
+                    self.settings_include_system_files = include_system_files;
                     self.status = if indexed == 0 {
                         format!(
-                            "Preparing global index for {} (Full Disk Access recommended)",
+                            "Preparing the user-file index for {}",
                             root.display()
                         )
+                    } else if include_system_files {
+                        "Watching user and system files on the startup disk".to_owned()
                     } else {
-                        format!("Watching all accessible files under {}", root.display())
+                        format!("Watching user files under {}", root.display())
                     };
                 }
-                IndexEvent::ScanStarted => {
+                IndexEvent::ScanStarted { scope } => {
+                    self.search_cache_valid = false;
                     self.scanning = true;
-                    self.results.clear();
-                    self.native_icons.clear();
-                    self.indexed = 0;
                     self.discovered = 0;
                     self.skipped = 0;
-                    self.status = "Building the global index...".to_owned();
-                    // Invalidate any result produced by a query that was queued
-                    // before the rebuild cleared the database.
-                    if self.has_active_query() {
-                        self.schedule_search(context);
-                    } else {
+                    if scope == ScanScope::UserFiles {
                         self.clear_search_results();
+                        self.native_icons.clear();
+                        self.indexed = 0;
+                        self.status = "Building the user-file index...".to_owned();
+                    } else {
+                        self.cancel_active_search_keep_results();
+                        self.mark_results_stale(context);
+                        self.status =
+                            "Incrementally adding system and resource files...".to_owned();
                     }
                 }
                 IndexEvent::ScanProgress {
+                    scope,
                     discovered,
+                    indexed,
                     skipped,
                 } => {
                     self.discovered = discovered;
+                    self.indexed = indexed;
                     self.skipped = skipped;
-                    self.status = format!(
-                        "Indexing... {discovered} paths scanned, {} stored",
-                        self.indexed
-                    );
+                    self.status = match scope {
+                        ScanScope::UserFiles => format!(
+                            "Indexing user files... {discovered} paths scanned, {} stored",
+                            self.indexed
+                        ),
+                        ScanScope::SystemFiles => format!(
+                            "Adding system files... {discovered} paths scanned, {} total stored",
+                            self.indexed
+                        ),
+                    };
                 }
-                IndexEvent::ScanFinished { indexed, skipped } => {
+                IndexEvent::ScanFinished {
+                    scope,
+                    indexed,
+                    discovered,
+                    skipped,
+                } => {
                     self.scanning = false;
                     self.indexed = indexed;
-                    self.discovered = indexed + skipped;
+                    self.discovered = discovered;
                     self.skipped = skipped;
-                    self.status = if skipped > 0 && self.index.root() == Path::new("/") {
-                        format!(
-                            "Global scan complete: {} scanned, {indexed} indexed, {skipped} skipped — enable Full Disk Access for more",
-                            self.discovered
-                        )
-                    } else {
-                        format!(
-                            "Global scan complete: {} paths scanned, {indexed} stored",
-                            self.discovered
-                        )
+                    self.mark_results_stale(context);
+                    self.status = match scope {
+                        ScanScope::UserFiles => format!(
+                            "User scan complete: {discovered} paths scanned, {indexed} stored"
+                        ),
+                        ScanScope::SystemFiles => format!(
+                            "System increment complete: {discovered} paths scanned, {indexed} total stored"
+                        ),
                     };
-                    self.schedule_search_if_active(context);
+                }
+                IndexEvent::ScopeChangeStarted {
+                    include_system_files,
+                } => {
+                    self.search_cache_valid = false;
+                    self.scanning = true;
+                    self.status = if include_system_files {
+                        "Preparing to add system and resource files...".to_owned()
+                    } else {
+                        "Removing system files from the index...".to_owned()
+                    };
+                }
+                IndexEvent::ScopeChanged {
+                    include_system_files,
+                    indexed,
+                } => {
+                    self.scanning = false;
+                    self.include_system_files = include_system_files;
+                    self.settings_include_system_files = include_system_files;
+                    self.indexed = indexed;
+                    self.status = if include_system_files {
+                        "System-file indexing enabled; incremental scan is starting..."
+                            .to_owned()
+                    } else {
+                        "System files removed; watching user files only".to_owned()
+                    };
                 }
                 IndexEvent::ScanFailed(message) => {
                     self.scanning = false;
@@ -444,7 +507,11 @@ impl SearchApp {
                     self.pending_search = None;
                     self.status = message;
                 }
-                IndexEvent::SearchResults { id, results } => {
+                IndexEvent::SearchResults {
+                    id,
+                    results,
+                    incremental,
+                } => {
                     if id == self.latest_query_id {
                         self.searching = false;
                         if self.selected_path.as_ref().is_some_and(|selected| {
@@ -453,24 +520,29 @@ impl SearchApp {
                             self.selected_path = None;
                         }
                         self.results = results;
+                        self.results_stale = self.stale_refresh_due.is_some();
+                        self.search_cache_valid = !self.results_stale;
+                        if incremental && !self.results_stale {
+                            self.schedule_search_after(
+                                context,
+                                false,
+                                INCREMENTAL_VERIFY_DELAY,
+                            );
+                        }
                     }
                 }
                 IndexEvent::SearchFailed { id, message } => {
                     if id == 0 || id == self.latest_query_id {
                         self.searching = false;
+                        self.search_cache_valid = false;
                         self.pending_search = None;
                         self.status = message;
                     }
                 }
                 IndexEvent::IndexChanged { indexed } => {
                     self.indexed = indexed;
-                    if self.scanning {
-                        self.status = format!(
-                            "Indexing... {} paths scanned, {indexed} stored",
-                            self.discovered
-                        );
-                    }
-                    self.schedule_search_if_idle(context);
+                    self.search_cache_valid = false;
+                    self.mark_results_stale(context);
                 }
                 IndexEvent::WatcherWarning(message) => {
                     self.watcher_warning = Some(message);
@@ -481,13 +553,22 @@ impl SearchApp {
         }
     }
 
-    fn schedule_search(&mut self, context: &egui::Context) {
+    fn schedule_search(&mut self, context: &egui::Context, allow_incremental: bool) {
+        self.schedule_search_after(context, allow_incremental, SEARCH_DEBOUNCE);
+    }
+
+    fn schedule_search_after(
+        &mut self,
+        context: &egui::Context,
+        allow_incremental: bool,
+        delay: Duration,
+    ) {
         let id = self.next_query_id;
         self.next_query_id += 1;
         self.latest_query_id = id;
-        self.pending_search = Some((Instant::now() + SEARCH_DEBOUNCE, id));
+        self.pending_search = Some((Instant::now() + delay, id, allow_incremental));
         self.searching = true;
-        context.request_repaint_after(SEARCH_DEBOUNCE);
+        context.request_repaint_after(delay);
     }
 
     fn has_active_query(&self) -> bool {
@@ -499,26 +580,75 @@ impl SearchApp {
         // flight, then remove the pending query and visible rows immediately.
         self.latest_query_id = self.next_query_id;
         self.next_query_id += 1;
+        self.index.cancel_search();
         self.pending_search = None;
         self.searching = false;
+        self.results_stale = false;
+        self.stale_refresh_due = None;
         self.results.clear();
         self.selected_path = None;
     }
 
-    fn schedule_search_if_active(&mut self, context: &egui::Context) {
-        if self.has_active_query() {
-            self.schedule_search(context);
+    fn cancel_active_search_keep_results(&mut self) {
+        self.latest_query_id = self.next_query_id;
+        self.next_query_id += 1;
+        self.index.cancel_search();
+        self.pending_search = None;
+        self.searching = false;
+        self.stale_refresh_due = None;
+    }
+
+    fn mark_results_stale(&mut self, context: &egui::Context) {
+        if !self.has_active_query() {
+            return;
+        }
+        self.results_stale = true;
+        self.schedule_stale_refresh(context);
+    }
+
+    fn schedule_stale_refresh(&mut self, context: &egui::Context) {
+        if !self.window_visible
+            || !self.results_stale
+            || !self.has_active_query()
+            || self.stale_refresh_due.is_some()
+        {
+            return;
+        }
+        self.stale_refresh_due = Some(Instant::now() + INDEX_REFRESH_COALESCE);
+        context.request_repaint_after(INDEX_REFRESH_COALESCE);
+    }
+
+    fn refresh_stale_results_if_due(&mut self, context: &egui::Context) {
+        if !self.window_visible || !self.results_stale || !self.has_active_query() {
+            self.stale_refresh_due = None;
+            return;
+        }
+        let Some(deadline) = self.stale_refresh_due else {
+            self.schedule_stale_refresh(context);
+            return;
+        };
+        let now = Instant::now();
+        if now < deadline {
+            context.request_repaint_after(deadline - now);
+        } else if !self.searching {
+            self.stale_refresh_due = None;
+            self.schedule_search(context, false);
         }
     }
 
-    fn schedule_search_if_idle(&mut self, context: &egui::Context) {
-        if self.has_active_query() && self.pending_search.is_none() && !self.searching {
-            self.schedule_search(context);
+    fn refresh_stale_results_now(&mut self, context: &egui::Context) {
+        self.stale_refresh_due = None;
+        self.schedule_search(context, false);
+    }
+
+    fn schedule_search_if_active(&mut self, context: &egui::Context) {
+        if self.has_active_query() {
+            self.schedule_search(context, false);
         }
     }
 
     fn dispatch_search_if_due(&mut self, context: &egui::Context) {
-        let Some((deadline, id)) = self.pending_search else {
+        let Some((deadline, id, allow_incremental)) = self.pending_search else {
             return;
         };
         let now = Instant::now();
@@ -537,7 +667,8 @@ impl SearchApp {
         } else {
             self.query.clone()
         };
-        self.index.search(id, database_query, self.sort);
+        self.index
+            .search(id, database_query, self.sort, allow_incremental);
         self.pending_search = None;
     }
 
@@ -552,11 +683,13 @@ impl SearchApp {
             .as_ref()
             .is_some_and(GlobalShortcut::take_pressed);
         if shortcut_pressed {
+            self.window_visible = true;
             context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             context.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.focus_search_requested = true;
             self.refocus_window_next_frame = true;
+            self.schedule_stale_refresh(context);
             context.request_repaint();
         }
     }
@@ -573,6 +706,9 @@ impl SearchApp {
             // action and Command+Q set quit_requested before closing.
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible = false;
+            self.cancel_active_search_keep_results();
+            self.results_stale |= self.has_active_query();
             self.focus_search_requested = true;
         }
     }
@@ -598,8 +734,9 @@ impl SearchApp {
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let search_width = (ui.available_width() - 260.0).max(180.0);
+            let search_width = (ui.available_width() - 330.0).max(180.0);
             let search_id = ui.make_persistent_id("main_search_input");
+            let previous_query = self.query.clone();
             let search = ui.add_sized(
                 [search_width, 32.0],
                 egui::TextEdit::singleline(&mut self.query)
@@ -614,20 +751,30 @@ impl SearchApp {
             }
             if search.changed() {
                 if self.has_active_query() {
+                    let allow_incremental = self.search_cache_valid
+                        && !self.results_stale
+                        && SearchQuery::parse(&self.query)
+                            .is_strict_refinement_of(&SearchQuery::parse(&previous_query));
                     self.clear_search_results();
-                    self.schedule_search(ui.ctx());
+                    self.schedule_search(ui.ctx(), allow_incremental);
                 } else {
                     self.clear_search_results();
+                    self.search_cache_valid = false;
                     ui.ctx().request_repaint();
                 }
             }
             if ui.checkbox(&mut self.show_hidden, "Hidden").changed() {
                 ui.ctx().request_repaint();
             }
+            if ui.small_button("Settings").clicked() {
+                self.settings_include_system_files = self.include_system_files;
+                self.settings_open = true;
+            }
             let rebuild = ui
                 .add_enabled(!self.scanning, egui::Button::new("Rebuild index"))
                 .on_disabled_hover_text("An index scan is already running");
             if rebuild.clicked() {
+                self.search_cache_valid = false;
                 self.status = "Preparing to rebuild the index...".to_owned();
                 self.index.rebuild();
             }
@@ -639,6 +786,78 @@ impl SearchApp {
                 self.request_quit(ui.ctx());
             }
         });
+    }
+
+    fn draw_settings_window(&mut self, context: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+
+        let mut open = self.settings_open;
+        let mut apply_scope = None;
+        egui::Window::new("Settings / 设置")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(context, |ui| {
+                ui.heading("Index scope / 索引范围");
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.settings_include_system_files,
+                    "Index and search system files / 索引和搜索系统文件",
+                );
+                ui.label(
+                    "Disabled by default: only files under your home directory are indexed.",
+                );
+                ui.label("默认关闭：只索引当前用户主目录中的文件。");
+                ui.add_space(8.0);
+                if self.settings_include_system_files {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(190, 120, 20),
+                        "Enabling this incrementally scans the rest of the startup disk. Full Disk Access is recommended.",
+                    );
+                    ui.label(
+                        "启用后会增量扫描用户目录之外的启动磁盘内容，建议授予完全磁盘访问权限。",
+                    );
+                } else if self.include_system_files {
+                    ui.label(
+                        "Applying this removes system entries and returns file monitoring to your home directory.",
+                    );
+                    ui.label("应用后会移除系统条目，并只监控用户主目录。");
+                }
+                ui.add_space(10.0);
+                let changed =
+                    self.settings_include_system_files != self.include_system_files;
+                if ui
+                    .add_enabled(
+                        changed && !self.scanning,
+                        egui::Button::new("Apply / 应用"),
+                    )
+                    .on_disabled_hover_text(if self.scanning {
+                        "Wait for the current scan to finish / 请等待当前扫描完成"
+                    } else {
+                        "No changes / 设置未变化"
+                    })
+                    .clicked()
+                {
+                    apply_scope = Some(self.settings_include_system_files);
+                }
+            });
+        self.settings_open = open;
+
+        if let Some(include_system_files) = apply_scope {
+            self.search_cache_valid = false;
+            self.clear_search_results();
+            self.scanning = true;
+            self.status = if include_system_files {
+                "Preparing the incremental system-file scan...".to_owned()
+            } else {
+                "Preparing to remove system files from the index...".to_owned()
+            };
+            self.index
+                .set_include_system_files(include_system_files);
+        }
     }
 
     fn change_sort(&mut self, field: SortField, context: &egui::Context) {
@@ -798,7 +1017,7 @@ impl SearchApp {
             columns.kind,
             RESULT_ROW_HEIGHT,
             icon_kind.label(),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
             "type",
         );
         let (size_response, _) = draw_text_cell(
@@ -806,7 +1025,7 @@ impl SearchApp {
             columns.size,
             RESULT_ROW_HEIGHT,
             format_size(result.size),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
             "size",
         );
         let (modified_response, _) = draw_text_cell(
@@ -814,7 +1033,7 @@ impl SearchApp {
             columns.modified,
             RESULT_ROW_HEIGHT,
             format_modified(result.modified_at),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
             "modified",
         );
         let (path_response, _) = draw_text_cell(
@@ -822,7 +1041,7 @@ impl SearchApp {
             columns.path,
             RESULT_ROW_HEIGHT,
             &result.path,
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
             "path",
         );
         let (_, _, (finder_clicked, copy_clicked)) = draw_table_cell(
@@ -844,9 +1063,15 @@ impl SearchApp {
             .union(kind_response)
             .union(size_response)
             .union(modified_response)
-            .union(path_response);
+            .union(path_response)
+            .on_hover_text("Drag to Finder to copy, or drag to Trash");
 
-        if response.double_clicked() {
+        if response.drag_started() {
+            self.selected_path = Some(result.path.clone());
+            if let Err(message) = platform::begin_file_drag(Path::new(&result.path)) {
+                self.status = message;
+            }
+        } else if response.double_clicked() {
             self.selected_path = Some(result.path.clone());
             let _ = platform::reveal_in_finder(Path::new(&result.path));
         } else if response.clicked() {
@@ -1052,7 +1277,7 @@ fn draw_name_cell(
         ui,
         width,
         height,
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
         "name",
         |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -1287,6 +1512,7 @@ impl eframe::App for SearchApp {
         self.receive_events(context);
         self.native_icons.drain(context);
         self.dispatch_search_if_due(context);
+        self.refresh_stale_results_if_due(context);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1317,6 +1543,25 @@ impl eframe::App for SearchApp {
                     ui.separator();
                     ui.label(format!("{visible_count} results"));
                 }
+                if self.results_stale && self.has_active_query() {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(190, 120, 20),
+                        "Results may be outdated",
+                    );
+                    if ui
+                        .add_enabled(!self.searching, egui::Button::new("Refresh"))
+                        .clicked()
+                    {
+                        self.refresh_stale_results_now(ui.ctx());
+                    }
+                }
+                ui.separator();
+                ui.label(if self.include_system_files {
+                    "User + System"
+                } else {
+                    "User files only"
+                });
                 if self.skipped > 0 {
                     ui.separator();
                     ui.label(format!("{} inaccessible/skipped", self.skipped));
@@ -1345,6 +1590,7 @@ impl eframe::App for SearchApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| self.draw_results(ui));
+        self.draw_settings_window(ui.ctx());
     }
 }
 

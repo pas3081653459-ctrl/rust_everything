@@ -7,7 +7,7 @@ pub enum SearchMode {
     Path,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     pub mode: SearchMode,
     pub terms: Vec<String>,
@@ -101,6 +101,43 @@ impl SearchQuery {
         }
 
         true
+    }
+
+    pub fn supports_incremental_filtering(&self) -> bool {
+        match self.mode {
+            SearchMode::Name => {
+                self.terms.len() == 1
+                    && self.excluded.is_empty()
+                    && self.extension.is_none()
+                    && self.kind.is_none()
+            }
+            SearchMode::Path => self.path.is_some(),
+        }
+    }
+
+    pub fn is_strict_refinement_of(&self, previous: &Self) -> bool {
+        if !self.supports_incremental_filtering()
+            || !previous.supports_incremental_filtering()
+            || self.mode != previous.mode
+        {
+            return false;
+        }
+
+        match self.mode {
+            SearchMode::Name => {
+                let current = &self.terms[0];
+                let previous = &previous.terms[0];
+                current.len() > previous.len() && current.starts_with(previous)
+            }
+            SearchMode::Path => match (&self.path, &previous.path) {
+                (Some(current), Some(previous_path)) => {
+                    self.path_is_anchored == previous.path_is_anchored
+                        && current.len() > previous_path.len()
+                        && current.starts_with(previous_path)
+                }
+                _ => false,
+            },
+        }
     }
 
     pub fn rank(&self, result: &SearchResult) -> i64 {
@@ -274,5 +311,19 @@ mod tests {
         let query = SearchQuery::parse("project/src");
         assert!(query.matches(&result("/tmp/project/src/main.rs", "main.rs")));
         assert!(!query.matches(&result("/tmp/other/project-src.txt", "project/src")));
+    }
+
+    #[test]
+    fn detects_incremental_name_and_path_refinements() {
+        assert!(SearchQuery::parse("ser")
+            .is_strict_refinement_of(&SearchQuery::parse("se")));
+        assert!(SearchQuery::parse("数据库")
+            .is_strict_refinement_of(&SearchQuery::parse("数据")));
+        assert!(SearchQuery::parse("work/everything")
+            .is_strict_refinement_of(&SearchQuery::parse("work/every")));
+        assert!(!SearchQuery::parse("se")
+            .is_strict_refinement_of(&SearchQuery::parse("ser")));
+        assert!(!SearchQuery::parse("ser ext:rs")
+            .is_strict_refinement_of(&SearchQuery::parse("ser")));
     }
 }

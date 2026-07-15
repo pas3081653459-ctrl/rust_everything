@@ -66,13 +66,10 @@ pub struct FileRecord {
     pub parent: String,
     pub name: String,
     pub name_lower: String,
-    pub path_lower: String,
     pub extension: Option<String>,
     pub kind: EntryKind,
     pub size: Option<u64>,
     pub modified_at: Option<i64>,
-    pub device_id: u64,
-    pub inode: u64,
     pub hidden: bool,
 }
 
@@ -117,18 +114,14 @@ impl FileRecord {
             .map(|value| value.as_secs() as i64);
 
         #[cfg(target_os = "macos")]
-        let (device_id, inode, system_hidden) = {
+        let system_hidden = {
             use std::os::macos::fs::MetadataExt;
             const UF_HIDDEN: u32 = 0x0000_8000;
-            (
-                metadata.st_dev() as u64,
-                metadata.st_ino(),
-                metadata.st_flags() & UF_HIDDEN != 0,
-            )
+            metadata.st_flags() & UF_HIDDEN != 0
         };
 
         #[cfg(not(target_os = "macos"))]
-        let (device_id, inode, system_hidden) = (0, 0, false);
+        let system_hidden = false;
 
         let dot_hidden = path.components().any(|component| {
             component
@@ -139,7 +132,6 @@ impl FileRecord {
 
         Some(Self {
             name_lower: name.to_lowercase(),
-            path_lower: path_text.to_lowercase(),
             hidden: dot_hidden || system_hidden,
             path: path_text,
             parent,
@@ -148,8 +140,6 @@ impl FileRecord {
             kind,
             size: (kind == EntryKind::File).then_some(metadata.len()),
             modified_at,
-            device_id,
-            inode,
         })
     }
 }
