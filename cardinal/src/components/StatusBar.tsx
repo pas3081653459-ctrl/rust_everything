@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react';
 import type { AppLifecycleStatus } from '../types/ipc';
 import { useTranslation } from 'react-i18next';
 import { openPreferences } from '../utils/openPreferences';
+import { MonitoringControls } from './MonitoringControls';
 
 export type StatusTabKey = 'files' | 'events';
 
@@ -16,6 +17,7 @@ type StatusBarProps = {
   onTabChange: (tab: StatusTabKey) => void;
   onRequestRescan: () => void;
   rescanErrorCount: number;
+  onIndexUpdated?: () => void;
 };
 
 const TABS: StatusTabKey[] = ['files', 'events'];
@@ -34,8 +36,7 @@ const StatusBar = ({
   resultCount,
   activeTab,
   onTabChange,
-  onRequestRescan,
-  rescanErrorCount,
+  onIndexUpdated,
 }: StatusBarProps): React.JSX.Element => {
   const { t } = useTranslation();
   const tabsRef = useRef<HTMLDivElement | null>(null);
@@ -88,17 +89,6 @@ const StatusBar = ({
     : resultsText;
   const lifecycleMeta = LIFECYCLE_META[lifecycleState];
   const lifecycleLabel = t(`statusBar.lifecycle.${lifecycleState}`);
-  const rescanDisabled = lifecycleState === 'Initializing';
-  const rescanTitle = rescanDisabled
-    ? t('statusBar.rescan.disabledHint')
-    : t('statusBar.rescan.enabledHint');
-  const rescanTooltip =
-    rescanErrorCount > 0
-      ? `${rescanTitle}\n${t('statusBar.rescan.errorCountSuffix', {
-          count: rescanErrorCount,
-          formatted: rescanErrorCount.toLocaleString(),
-        })}`
-      : rescanTitle;
   const indicatorLabel = t('statusBar.aria.status', { status: lifecycleLabel });
 
   const handleOpenPreferences = useCallback(() => {
@@ -149,19 +139,7 @@ const StatusBar = ({
           })}
         </div>
         <div className="status-controls">
-          <button
-            type="button"
-            className="status-icon-button status-rescan-button"
-            onClick={onRequestRescan}
-            disabled={rescanDisabled}
-            title={rescanTooltip}
-            aria-label={t('statusBar.aria.rescan')}
-          >
-            <span className="status-rescan-icon" aria-hidden="true">
-              ↻
-            </span>
-            <span className="sr-only">{t('statusBar.aria.rescan')}</span>
-          </button>
+          <MonitoringControls disabled={lifecycleState === 'Initializing'} onIndexUpdated={onIndexUpdated} />
           <button
             type="button"
             className="status-icon-button status-settings-button"

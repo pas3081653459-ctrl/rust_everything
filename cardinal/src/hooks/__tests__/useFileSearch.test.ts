@@ -14,6 +14,11 @@ const mockedInvoke = vi.mocked(invoke);
 const searchResponse = (results: SlabIndex[] = []) => ({
   results,
   highlights: [],
+  total: results.length,
+  page: 0,
+  pageSize: 100,
+  version: 1,
+  root: null,
   statusCode: SearchStatusCode.OK,
 });
 
@@ -22,7 +27,7 @@ const mockSearchSuccess = (results: SlabIndex[] = []) => {
     if (command === 'get_app_status') {
       return Promise.resolve('Ready');
     }
-    if (command === 'search') {
+    if (command === 'search_first_page') {
       return Promise.resolve(searchResponse(results));
     }
     return Promise.resolve(null);
@@ -34,7 +39,7 @@ const mockSearchCancelled = () => {
     if (command === 'get_app_status') {
       return Promise.resolve('Ready');
     }
-    if (command === 'search') {
+    if (command === 'search_first_page') {
       return Promise.resolve({
         results: [],
         highlights: [],
@@ -100,7 +105,7 @@ describe('useFileSearch', () => {
     });
 
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenCalledWith('search', {
+      expect(mockedInvoke).toHaveBeenCalledWith('search_first_page', {
         query: null,
         directoryQuery: null,
         options: {
@@ -118,7 +123,7 @@ describe('useFileSearch', () => {
       result.current.queueDirectorySearch('Projects', { immediate: true });
     });
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenLastCalledWith('search', {
+      expect(mockedInvoke).toHaveBeenLastCalledWith('search_first_page', {
         query: null,
         directoryQuery: null,
         options: {
@@ -132,7 +137,7 @@ describe('useFileSearch', () => {
       result.current.queueDirectoryScopeOpen(true);
     });
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenLastCalledWith('search', {
+      expect(mockedInvoke).toHaveBeenLastCalledWith('search_first_page', {
         query: null,
         directoryQuery: 'Projects',
         options: {
@@ -148,7 +153,7 @@ describe('useFileSearch', () => {
       result.current.queueDirectoryScopeOpen(false);
     });
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenLastCalledWith('search', {
+      expect(mockedInvoke).toHaveBeenLastCalledWith('search_first_page', {
         query: null,
         directoryQuery: null,
         options: {
@@ -172,7 +177,7 @@ describe('useFileSearch', () => {
     });
 
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenLastCalledWith('search', {
+      expect(mockedInvoke).toHaveBeenLastCalledWith('search_first_page', {
         query: null,
         directoryQuery: 'Projects',
         options: {
@@ -194,7 +199,7 @@ describe('useFileSearch', () => {
     });
 
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenLastCalledWith('search', {
+      expect(mockedInvoke).toHaveBeenLastCalledWith('search_first_page', {
         query: null,
         directoryQuery: '   ',
         options: {
@@ -215,7 +220,7 @@ describe('useFileSearch', () => {
     });
 
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenLastCalledWith('search', {
+      expect(mockedInvoke).toHaveBeenLastCalledWith('search_first_page', {
         query: '   ',
         directoryQuery: null,
         options: {
@@ -224,5 +229,40 @@ describe('useFileSearch', () => {
       });
       expect(result.current.state.currentQuery).toBe('   ');
     });
+  });
+});
+
+
+describe('paged file search', () => {
+  it('does not request a page while the worker is waiting for permission', async () => {
+    mockedInvoke.mockClear();
+    mockedInvoke.mockImplementation((command: string) => {
+      if (command === 'get_app_status') return Promise.resolve('Initializing');
+      return Promise.resolve(searchResponse());
+    });
+    const { result } = renderHook(() => useFileSearch());
+    await act(async () => { await Promise.resolve(); });
+    act(() => result.current.queueSearch('waiting', { immediate: true }));
+    expect(mockedInvoke.mock.calls.some(([command]) => command === 'search_first_page')).toBe(false);
+    act(() => result.current.setLifecycleState('Ready'));
+    await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('search_first_page', {
+      query: 'waiting', directoryQuery: null, options: { caseInsensitive: true },
+    }));
+  });
+
+  it('keeps the total separate from the current page and requests pages by version', async () => {
+    mockedInvoke.mockImplementation((command: string) => {
+      if (command === 'get_app_status') return Promise.resolve('Ready');
+      if (command === 'search_first_page') return Promise.resolve({ ...searchResponse([1] as SlabIndex[]), total: 4000000, version: 42 });
+      if (command === 'get_result_page') return Promise.resolve({ ...searchResponse([2] as SlabIndex[]), total: 4000000, version: 42, page: 9 });
+      return Promise.resolve(null);
+    });
+    const { result } = await renderReadySearchHook();
+    expect(result.current.state.resultCount).toBe(4000000);
+    expect(result.current.state.results).toHaveLength(1);
+    act(() => result.current.goToPage(9));
+    await waitFor(() => expect(result.current.state.page).toBe(9));
+    expect(mockedInvoke).toHaveBeenCalledWith('get_result_page', { version: 42, page: 9 });
+    expect(result.current.state.results).toEqual([2]);
   });
 });

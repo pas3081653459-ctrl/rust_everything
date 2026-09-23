@@ -1,4 +1,6 @@
-import { useRef, useCallback, useEffect, useMemo } from 'react';
+import { useRef, useCallback, useEffect, useMemo, useState } from 'react';
+import { ResultPagination } from './components/ResultPagination';
+import { LargeFilesDialog } from './components/LargeFilesDialog';
 import type { ChangeEvent, CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import './App.css';
 import { FileRow } from './components/FileRow';
@@ -32,6 +34,7 @@ import { useFilesTabEffects } from './hooks/useFilesTabEffects';
 import { useFilesTabState } from './hooks/useFilesTabState';
 
 function App() {
+  const [largeFilesOpen, setLargeFilesOpen] = useState(false);
   const {
     state,
     searchParams,
@@ -42,10 +45,15 @@ function App() {
     handleStatusUpdate,
     setLifecycleState,
     requestRescan,
+    goToPage,
   } = useFileSearch();
   const {
     results,
     resultsVersion,
+    resultSetVersion,
+    page,
+    pageSize,
+    root,
     scannedFiles,
     processedEvents,
     rescanErrors,
@@ -82,6 +90,7 @@ function App() {
     handleSortToggle,
   } = useRemoteSort(results, resultsVersion, i18n.language, (limit) =>
     t('sorting.disabled', { limit }),
+    { version: resultSetVersion, page, total: resultCount, home: root !== null },
   );
 
   // Centralized selection management for the virtualized files list.
@@ -349,7 +358,7 @@ function App() {
     [colWidths, eventColWidths],
   );
 
-  const showFullDiskAccessOverlay = fullDiskAccessStatus === 'denied';
+  const showFullDiskAccessOverlay = fullDiskAccessStatus !== 'granted';
   const overlayStatusMessage = isCheckingFullDiskAccess
     ? t('app.fullDiskAccess.status.checking')
     : t('app.fullDiskAccess.status.disabled');
@@ -372,27 +381,42 @@ function App() {
   return (
     <>
       <main className="container" aria-hidden={showFullDiskAccessOverlay || isPreferencesOpen}>
-        <SearchBar
-          inputRef={searchInputRef}
-          placeholder={searchPlaceholder}
-          ariaLabel={searchAriaLabel}
-          value={searchInputValue}
-          onChange={onQueryChange}
-          onKeyDown={onSearchInputKeyDown}
-          directoryScopeEnabled={activeTab === 'files'}
-          directoryScopeOpen={directoryScopeOpen}
-          directoryScopeLabel={directoryScopeLabel}
-          directoryPlaceholder={directorySearchPlaceholder}
-          directoryValue={directoryInputValue}
-          onToggleDirectoryScope={toggleDirectoryScope}
-          onDirectoryChange={onDirectoryQueryChange}
-          onDirectoryKeyDown={onDirectoryInputKeyDown}
-          caseSensitive={caseSensitive}
-          onToggleCaseSensitive={onToggleCaseSensitive}
-          caseSensitiveLabel={caseSensitiveLabel}
-          onFocus={handleSearchFocus}
-          onBlur={handleSearchBlur}
-        />
+        <div className="search-controls">
+          <SearchBar
+            inputRef={searchInputRef}
+            placeholder={searchPlaceholder}
+            ariaLabel={searchAriaLabel}
+            value={searchInputValue}
+            onChange={onQueryChange}
+            onKeyDown={onSearchInputKeyDown}
+            directoryScopeEnabled={activeTab === 'files'}
+            directoryScopeOpen={directoryScopeOpen}
+            directoryScopeLabel={directoryScopeLabel}
+            directoryPlaceholder={directorySearchPlaceholder}
+            directoryValue={directoryInputValue}
+            onToggleDirectoryScope={toggleDirectoryScope}
+            onDirectoryChange={onDirectoryQueryChange}
+            onDirectoryKeyDown={onDirectoryInputKeyDown}
+            caseSensitive={caseSensitive}
+            onToggleCaseSensitive={onToggleCaseSensitive}
+            caseSensitiveLabel={caseSensitiveLabel}
+            onFocus={handleSearchFocus}
+            onBlur={handleSearchBlur}
+          />
+          {activeTab === 'files' && (
+            <button
+              type="button"
+              className="large-files-entry"
+              disabled={lifecycleState !== 'Ready'}
+              onClick={() => {
+                closeQuickLook();
+                setLargeFilesOpen(true);
+              }}
+            >
+              {t('largeFiles.title')}
+            </button>
+          )}
+        </div>
         <div className={resultsContainerClassName} style={containerStyle}>
           {activeTab === 'events' ? (
             <FSEventsPanel
@@ -409,6 +433,9 @@ function App() {
             // `displayedResultsVersion`: visible-order/projection changes. This refreshes viewport
             // work such as icon hydration and frozen-view handoff in VirtualList.
             <FilesTabContent
+              pagination={<ResultPagination page={page} total={resultCount} pageSize={pageSize}
+                root={root} disabled={showLoadingUI || !initialFetchCompleted || lifecycleState !== 'Ready'}
+                onPage={goToPage} />}
               headerRef={headerRef}
               onResizeStart={onResizeStart}
               onHeaderContextMenu={showFilesHeaderContextMenu}
@@ -440,6 +467,7 @@ function App() {
           activeTab={activeTab}
           onTabChange={onTabChange}
           onRequestRescan={requestRescan}
+          onIndexUpdated={refreshSearchResults}
           rescanErrorCount={rescanErrors}
         />
       </main>
@@ -461,6 +489,7 @@ function App() {
         onReset={handleResetPreferences}
         themeResetToken={preferencesResetToken}
       />
+      {largeFilesOpen && <LargeFilesDialog onClose={() => setLargeFilesOpen(false)} />}
       {showFullDiskAccessOverlay && (
         <PermissionOverlay
           title={t('app.fullDiskAccess.title')}

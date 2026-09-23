@@ -5,6 +5,19 @@ export function formatKB(bytes: number | null | undefined): string | null {
   return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
 }
 
+// Binary thresholds match the search engine's size: units.
+export function formatFileSize(bytes: number | null | undefined): string | null {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return null;
+  const [divisor, unit] = bytes >= 1024 ** 3
+    ? [1024 ** 3, 'GB'] as const
+    : bytes >= 1024 ** 2
+      ? [1024 ** 2, 'MB'] as const
+      : bytes >= 1024
+        ? [1024, 'KB'] as const
+        : [1, 'B'] as const;
+  return `${Number((bytes / divisor).toFixed(2))} ${unit}`;
+}
+
 // Format timestamp (in seconds) as YYYY-MM-DD HH:mm:ss
 export function formatTimestamp(timestampSec: number | null | undefined): string | null {
   if (timestampSec == null || !Number.isFinite(timestampSec)) return null;

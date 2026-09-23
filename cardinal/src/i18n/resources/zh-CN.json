@@ -1,4 +1,50 @@
 {
+  "copyPath": { "idle": "复制完整路径", "copied": "已复制", "failed": "复制失败，请重试" },
+  "pagination": {
+    "root": "扫描根目录：{{root}}",
+    "first": "首页",
+    "previous": "上一页",
+    "next": "下一页",
+    "last": "末页",
+    "jump": "跳转",
+    "summary": "第 {{page}} / {{pages}} 页 · 共 {{total}} 项 · 每页 {{pageSize}} 项"
+  },
+  "monitoring": {
+    "refresh": "刷新索引",
+    "refreshHint": "按需补齐文件变化；没有索引或事件历史不完整时会重新扫描。关闭监听后，文件变化需手动刷新。",
+    "switch": "事件监听",
+    "switchHint": "默认关闭。开启后持续在后台监听文件变化、更新索引并记录事件；关闭后停止监听。",
+    "refreshing": "正在更新索引…",
+    "needsInitialScan": "请点击刷新建立索引",
+    "live": "实时监听中",
+    "cached": "监听关闭 · 使用缓存",
+    "stop": "停止更新",
+    "failed": "更新失败（悬停查看原因）"
+  },
+  "largeFiles": {
+    "title": "大文件 > 1 MB",
+    "description": "查找全部已索引且大于 1,048,576 字节的普通文件，默认从大到小排序。遵循扫描范围和忽略设置，不受搜索框条件限制。结果采用扫描时读取的大小；文件变化后请刷新。",
+    "close": "关闭",
+    "refresh": "刷新",
+    "cancel": "取消",
+    "scanning": "正在读取文件大小…",
+    "sorting": "正在对全部匹配文件排序…",
+    "ready": "已完成",
+    "cancelled": "已取消",
+    "error": "查找失败",
+    "progress": "已检查 {{checked}} / {{total}} · 匹配 {{matched}} · 无法读取 {{skipped}}",
+    "path": "路径",
+    "size": "大小",
+    "actions": "操作",
+    "open": "打开",
+    "reveal": "在 Finder 显示",
+    "empty": "没有找到可读取且大于 1 MB 的文件。",
+    "first": "首页",
+    "previous": "上一页",
+    "next": "下一页",
+    "last": "末页",
+    "page": "第 {{page}} / {{pages}} 页"
+  },
   "search": {
     "placeholder": {
       "files": "搜索文件和文件夹…",

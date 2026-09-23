@@ -1,4 +1,50 @@
 {
+  "copyPath": { "idle": "Copy full path", "copied": "Copied", "failed": "Copy failed; try again" },
+  "pagination": {
+    "root": "Scan root: {{root}}",
+    "first": "First",
+    "previous": "Previous",
+    "next": "Next",
+    "last": "Last",
+    "jump": "Go to page",
+    "summary": "Page {{page}} / {{pages}} · {{total}} items · {{pageSize}} per page"
+  },
+  "monitoring": {
+    "refresh": "Refresh index",
+    "refreshHint": "Catch up with file changes on demand. A missing index or incomplete history requires a scan. Refresh manually when monitoring is off.",
+    "switch": "Monitor events",
+    "switchHint": "Off by default. Enable background file monitoring, index updates and event recording. Disable to stop the watcher.",
+    "refreshing": "Updating index…",
+    "needsInitialScan": "Click Refresh to build the index",
+    "live": "Monitoring live",
+    "cached": "Monitoring off · Cached index",
+    "stop": "Stop updating",
+    "failed": "Update failed (hover for details)"
+  },
+  "largeFiles": {
+    "title": "Large files > 1 MB",
+    "description": "All indexed regular files larger than 1,048,576 bytes, largest first. Uses your indexing scope and exclusions, independently of the search boxes. Results reflect sizes observed during the scan; refresh after file changes.",
+    "close": "Close",
+    "refresh": "Refresh",
+    "cancel": "Cancel",
+    "scanning": "Reading file sizes…",
+    "sorting": "Sorting all matches…",
+    "ready": "Complete",
+    "cancelled": "Cancelled",
+    "error": "Search failed",
+    "progress": "Checked {{checked}} / {{total}} · Matches {{matched}} · Unreadable {{skipped}}",
+    "path": "Path",
+    "size": "Size",
+    "actions": "Actions",
+    "open": "Open",
+    "reveal": "Show in Finder",
+    "empty": "No readable files larger than 1 MB were found.",
+    "first": "First",
+    "previous": "Previous",
+    "next": "Next",
+    "last": "Last",
+    "page": "Page {{page}} / {{pages}}"
+  },
   "search": {
     "placeholder": {
       "files": "Search for files and folders...",

@@ -36,6 +36,11 @@ async function buildAppMenu(): Promise<void> {
     text: i18n.t('menu.hide'),
     accelerator: 'Esc',
     action: () => {
+      const dialog = document.querySelector<HTMLDialogElement>('.large-files-dialog[open]');
+      if (dialog) {
+        dialog.dispatchEvent(new Event('cancel', { cancelable: true }));
+        return;
+      }
       void invoke('hide_main_window');
     },
   });

@@ -11,6 +11,7 @@ import type { SlabIndex } from '../types/slab';
 import type { SortKey, SortState } from '../types/sort';
 
 type FilesTabContentProps = {
+  pagination?: ReactNode;
   headerRef: React.Ref<HTMLDivElement>;
   onResizeStart: (columnKey: ColumnKey) => (event: ReactMouseEvent<HTMLSpanElement>) => void;
   onHeaderContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => void;
@@ -39,6 +40,7 @@ type FilesTabContentProps = {
 };
 
 export function FilesTabContent({
+  pagination,
   headerRef,
   onResizeStart,
   onHeaderContextMenu,
@@ -91,6 +93,7 @@ export function FilesTabContent({
           />
         )}
       </div>
+      {pagination}
     </div>
   );
 }

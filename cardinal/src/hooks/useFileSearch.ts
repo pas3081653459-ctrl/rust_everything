@@ -5,7 +5,7 @@ import { SEARCH_DEBOUNCE_MS } from '../constants';
 import {
   SearchStatusCode,
   type AppLifecycleStatus,
-  type SearchResponsePayload,
+  type ResultPagePayload,
 } from '../types/ipc';
 import type { SlabIndex } from '../types/slab';
 
@@ -13,6 +13,10 @@ type SearchError = string | Error | null;
 
 type SearchState = {
   results: SlabIndex[];
+  resultSetVersion: number;
+  page: number;
+  pageSize: number;
+  root: string | null;
   resultsVersion: number;
   scannedFiles: number;
   processedEvents: number;
@@ -58,6 +62,10 @@ type SearchAction =
         duration: number;
         count: number;
         highlightTerms: string[];
+        resultSetVersion: number;
+        page: number;
+        pageSize: number;
+        root: string | null;
       };
     }
   | {
@@ -72,6 +80,10 @@ type SearchAction =
 
 const initialSearchState: SearchState = {
   results: [],
+  resultSetVersion: 0,
+  page: 0,
+  pageSize: 100,
+  root: null,
   resultsVersion: 0,
   scannedFiles: 0,
   processedEvents: 0,
@@ -148,6 +160,10 @@ function reducer(state: SearchState, action: SearchAction): SearchState {
       return {
         ...state,
         results: action.payload.results,
+        resultSetVersion: action.payload.resultSetVersion,
+        page: action.payload.page,
+        pageSize: action.payload.pageSize,
+        root: action.payload.root,
         resultsVersion: state.resultsVersion + 1,
         currentQuery: action.payload.query,
         currentDirectoryQuery: action.payload.directoryQuery,
@@ -203,6 +219,7 @@ type UseFileSearchResult = {
   handleStatusUpdate: (scannedFiles: number, processedEvents: number, rescanErrors: number) => void;
   setLifecycleState: (status: AppLifecycleStatus) => void;
   requestRescan: () => Promise<void>;
+  goToPage: (page: number) => void;
 };
 
 export function useFileSearch(): UseFileSearchResult {
@@ -216,6 +233,8 @@ export function useFileSearch(): UseFileSearchResult {
   // and will auto-increment for each search request
   // so this only serves as a defence-in-depth
   const searchVersionRef = useRef(0);
+  const lifecycleRef = useRef<AppLifecycleStatus>('Initializing');
+  const resultSetVersionRef = useRef<number | null>(null);
   const hasInitialSearchRunRef = useRef(false);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadingDelayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -244,6 +263,7 @@ export function useFileSearch(): UseFileSearchResult {
   );
 
   const setLifecycleState = useCallback((status: AppLifecycleStatus) => {
+    lifecycleRef.current = status;
     dispatch({ type: 'SET_LIFECYCLE_STATE', payload: { status } });
   }, []);
 
@@ -269,9 +289,11 @@ export function useFileSearch(): UseFileSearchResult {
     cancelTimer(loadingDelayTimerRef);
   }, []);
 
-  const handleSearch = useCallback(async (overrides: Partial<SearchParams> = {}) => {
+  const handleSearch = useCallback(async (overrides: Partial<SearchParams> = {}, page?: number) => {
     const nextSearch = { ...latestSearchRef.current, ...overrides };
     latestSearchRef.current = nextSearch;
+    // The worker does not consume requests until permission and cache loading finish.
+    if (lifecycleRef.current === 'Initializing') return;
     // the backend already has search version cancellation
     // but we keep the check at frontend to make sure that
     // the UI always reflects the latest request
@@ -294,13 +316,13 @@ export function useFileSearch(): UseFileSearchResult {
     }
 
     try {
-      const rawResults = await invoke<SearchResponsePayload>('search', {
+      const rawResults = await invoke<ResultPagePayload>(page === undefined ? 'search_first_page' : 'get_result_page', page === undefined ? {
         query: searchParamOrNull(query),
         directoryQuery: searchParamOrNull(directoryQuery),
         options: {
           caseInsensitive: !caseSensitive,
         },
-      });
+      } : { version: resultSetVersionRef.current, page });
 
       if (searchVersionRef.current !== requestVersion) {
         return;
@@ -312,6 +334,7 @@ export function useFileSearch(): UseFileSearchResult {
         return;
       }
 
+      resultSetVersionRef.current = rawResults.version;
       const searchResults = rawResults.results as SlabIndex[];
       const highlightTerms = Array.isArray(rawResults.highlights)
         ? rawResults.highlights.filter((term): term is string => typeof term === 'string')
@@ -329,7 +352,11 @@ export function useFileSearch(): UseFileSearchResult {
           query,
           directoryQuery,
           duration,
-          count: searchResults.length,
+          count: rawResults.total,
+          resultSetVersion: rawResults.version,
+          page: rawResults.page,
+          pageSize: rawResults.pageSize,
+          root: rawResults.root,
           highlightTerms,
         },
       });
@@ -362,6 +389,8 @@ export function useFileSearch(): UseFileSearchResult {
 
   const queueSearchParams = useCallback(
     (patch: Partial<SearchParams>, options?: QueueSearchOptions) => {
+      resultSetVersionRef.current = null;
+      searchVersionRef.current += 1;
       updateSearchParams(patch);
       cancelPendingSearches();
       if (options?.immediate) {
@@ -402,8 +431,9 @@ export function useFileSearch(): UseFileSearchResult {
   useEffect(() => cancelPendingSearches, [cancelPendingSearches]);
 
   useEffect(() => {
+    if (state.lifecycleState === 'Initializing') return;
     if (!hasInitialSearchRunRef.current) {
-      void handleSearch({ query: '' });
+      void handleSearch();
       return;
     }
 
@@ -413,7 +443,13 @@ export function useFileSearch(): UseFileSearchResult {
     }
 
     void handleSearch();
-  }, [handleSearch, searchParams.caseSensitive]);
+  }, [handleSearch, searchParams.caseSensitive, state.lifecycleState]);
+
+  const goToPage = useCallback((page: number) => {
+    if (resultSetVersionRef.current === null || !Number.isSafeInteger(page) || page < 0) return;
+    cancelPendingSearches();
+    void handleSearch({}, page);
+  }, [cancelPendingSearches, handleSearch]);
 
   const requestRescan = useCallback(async () => {
     await invoke('trigger_rescan');
@@ -429,5 +465,6 @@ export function useFileSearch(): UseFileSearchResult {
     handleStatusUpdate,
     setLifecycleState,
     requestRescan,
+    goToPage,
   };
 }

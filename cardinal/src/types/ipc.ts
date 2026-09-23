@@ -35,3 +35,11 @@ export type SearchResponsePayload = {
   highlights?: string[];
   statusCode: SearchStatusCode;
 };
+
+export type ResultPagePayload = SearchResponsePayload & {
+  total: number;
+  page: number;
+  pageSize: number;
+  version: number;
+  root: string | null;
+};

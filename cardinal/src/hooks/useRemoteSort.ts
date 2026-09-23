@@ -59,6 +59,7 @@ export const useRemoteSort = (
   resultsVersion: number,
   locale: string,
   formatDisabledTooltip: (limit: string) => string | null,
+  pagination?: { version: number; page: number; total: number; home: boolean },
 ): RemoteSortControls => {
   const [sortState, setSortState] = useState<SortState>(null);
   const [sortedResults, setSortedResults] = useState<SlabIndex[]>([]);
@@ -71,7 +72,11 @@ export const useRemoteSort = (
     0,
   );
 
-  const canSort = results.length <= sortThreshold;
+  const version = pagination?.version;
+  const page = pagination?.page ?? 0;
+  const home = pagination?.home ?? false;
+  const effectiveThreshold = pagination ? (home ? 100 : Math.min(sortThreshold, 20000)) : sortThreshold;
+  const canSort = (pagination?.total ?? results.length) <= effectiveThreshold;
   const shouldUseSortedResults = Boolean(sortState && canSort);
   const displayedResults = shouldUseSortedResults ? sortedResults : results;
 
@@ -119,29 +124,33 @@ export const useRemoteSort = (
 
     void (async () => {
       try {
-        const ordered = await invoke<number[]>('get_sorted_view', {
-          results,
-          sort: sortState,
-        });
+        const ordered = await invoke<number[]>(version !== undefined && !home ? 'get_sorted_result_page' : 'get_sorted_view',
+          version !== undefined && !home ? { version, page, sort: sortState } : { results, sort: sortState });
         if (sortRequestRef.current === requestId) {
           setSortedResults(ordered as SlabIndex[]);
           bumpDisplayedResultsVersion();
         }
+      } catch (error) {
+        if (sortRequestRef.current === requestId) {
+          setSortedResults(results);
+          setSortState(null);
+        }
+        console.error('Failed to sort results:', error);
       } finally {
         if (sortRequestRef.current === requestId) {
           setIsSorting(false);
         }
       }
     })();
-  }, [results, sortState, canSort, bumpDisplayedResultsVersion]);
+  }, [results, sortState, canSort, bumpDisplayedResultsVersion, version, page, home]);
 
   useEffect(() => {
     bumpDisplayedResultsVersion();
   }, [resultsVersion, shouldUseSortedResults]);
 
   const sortLimitLabel = useMemo(
-    () => new Intl.NumberFormat(locale).format(sortThreshold),
-    [locale, sortThreshold],
+    () => new Intl.NumberFormat(locale).format(effectiveThreshold),
+    [locale, effectiveThreshold],
   );
   const sortDisabledTooltip = canSort ? null : formatDisabledTooltip(sortLimitLabel);
   const sortButtonsDisabled = !canSort || isSorting;

@@ -4,7 +4,6 @@ use crate::{
     quicklook::{
         QuickLookItemInput, close_preview_panel, toggle_preview_panel, update_preview_panel,
     },
-    search_activity,
     sort::{SortEntry, SortStatePayload, sort_entries},
     window_controls::{activate_main_window_impl, hide_main_window_impl, toggle_main_window_impl},
 };
@@ -58,9 +57,14 @@ pub struct SearchJob {
 }
 
 #[derive(Debug, Clone)]
-pub struct NodeInfoRequest {
-    pub slab_indices: Vec<SlabIndex>,
-    pub response_tx: Sender<Vec<SearchResultNode>>,
+pub enum NodeInfoRequest {
+    RootPage { page: usize, response_tx: Sender<(String, usize, usize, Vec<SlabIndex>)> },
+    Nodes {
+        slab_indices: Vec<SlabIndex>,
+        response_tx: Sender<Vec<SearchResultNode>>,
+    },
+    LargeFiles(crate::large_files::CacheRequest),
+    SetMonitoring { enabled: bool, token: CancellationToken },
 }
 
 #[derive(Default)]
@@ -71,7 +75,7 @@ struct SortedViewCache {
 
 pub struct SearchState {
     search_tx: Sender<SearchJob>,
-    node_info_tx: Sender<NodeInfoRequest>,
+    pub(crate) node_info_tx: Sender<NodeInfoRequest>,
     icon_viewport_tx: Sender<(u64, Vec<SlabIndex>)>,
     rescan_tx: Sender<CancellationToken>,
     watch_config_tx: Sender<WatchConfigUpdate>,
@@ -99,13 +103,17 @@ impl SearchState {
         }
     }
 
+    pub(crate) fn clear_sort_cache(&self) {
+        self.sorted_view_cache.lock().take();
+    }
+
     fn request_nodes(&self, slab_indices: Vec<SlabIndex>) -> Vec<SearchResultNode> {
         if slab_indices.is_empty() {
             return Vec::new();
         }
 
         let (response_tx, response_rx) = bounded::<Vec<SearchResultNode>>(1);
-        if let Err(e) = self.node_info_tx.send(NodeInfoRequest {
+        if let Err(e) = self.node_info_tx.send(NodeInfoRequest::Nodes {
             slab_indices,
             response_tx,
         }) {
@@ -288,7 +296,11 @@ pub async fn search(
     options: Option<SearchOptionsPayload>,
     state: State<'_, SearchState>,
 ) -> Result<SearchResponse, String> {
-    search_activity::note_search_activity();
+    if load_app_state() == crate::lifecycle::AppLifecycleState::Initializing {
+        return Err("Index not ready; complete permission setup and wait for initialization".into());
+    }
+    // Node IDs can stay identical after a refresh while sizes and paths change.
+    state.sorted_view_cache.lock().take();
 
     let options = options.unwrap_or_default();
     let cancellation_token = CancellationToken::new_search();

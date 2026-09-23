@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Cardinal",
+  "productName": "everything",
   "version": "0.1.23",
   "identifier": "com.cardinal.one",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Cardinal",
+        "title": "everything",
         "width": 1200,
         "height": 800
       }

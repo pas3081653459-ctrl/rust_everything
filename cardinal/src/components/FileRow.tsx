@@ -1,5 +1,6 @@
 import React, { memo, useCallback, DragEvent, useRef } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
+import { CopyPathButton } from './CopyPathButton';
 import { MiddleEllipsisHighlight } from './MiddleEllipsisHighlight';
 import { formatKB, formatTimestamp } from '../utils/format';
 import type { SearchResultItem } from '../types/search';
@@ -162,9 +163,10 @@ export const FileRow = memo(function FileRow({
         />
       </div>
       {/* Directory column renders the parent path (the filename column already shows the leaf). */}
-      <span className="path-text" title={directoryPath}>
-        {directoryPath}
-      </span>
+      <div className="path-copy-cell">
+        <span className="path-text" title={directoryPath}>{directoryPath}</span>
+        <CopyPathButton path={path} />
+      </div>
       <span className={`size-text ${!sizeText ? 'muted' : ''}`}>{sizeText || '—'}</span>
       <span className={`mtime-text ${!mtimeText ? 'muted' : ''}`}>{mtimeText || '—'}</span>
       <span className={`ctime-text ${!ctimeText ? 'muted' : ''}`}>{ctimeText || '—'}</span>

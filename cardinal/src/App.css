@@ -111,13 +111,19 @@ main,
 .container {
   margin: 0;
   display: grid;
-  grid-template-rows: auto 1fr auto; /* search bar | scroll area | status bar */
+  grid-template-rows: auto minmax(0, 1fr) auto; /* search controls | results | status bar */
   grid-template-columns: 100%;
   text-align: center;
   height: 100vh;
 }
 
 /* === Search Bar === */
+.search-controls {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .search-container {
   margin: var(--container-padding) var(--container-padding) 0;
   padding: 0;
@@ -1203,6 +1209,28 @@ button:active:not(:disabled) {
 }
 
 /* === Merged: StatusBar.css === */
+.monitoring-controls,
+.monitoring-controls label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.monitoring-controls button {
+  padding: 2px 7px;
+  color: var(--color-text);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.monitoring-controls button:disabled { opacity: 0.5; }
+.monitoring-controls label { white-space: nowrap; cursor: pointer; }
+.monitoring-message { color: var(--color-muted); font-size: 11px; }
+.monitoring-message[role='alert'] { color: #b54708; }
+@media (max-width: 1000px) {
+  .monitoring-message { display: none; }
+}
+
 .status-bar {
   height: 30px;
   background: var(--color-elevated-bg);
@@ -2051,3 +2079,14 @@ button:active:not(:disabled) {
   overflow-x: auto;
   overflow-y: hidden;
 }
+
+.result-pagination { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex-shrink: 0; padding: 8px 12px; border-top: 1px solid var(--border-color, #ddd); font-size: 12px; }
+.result-pagination form { display: flex; gap: 6px; align-items: center; }
+.result-pagination input { width: 70px; }
+.result-root { flex: 1 1 180px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.path-copy-cell { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; }
+.path-copy-cell .path-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-path-button { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 24px; width: 24px; height: 24px; padding: 3px; margin-right: 4px; }
+.copy-path-button svg { width: 16px; height: 16px; }
+.copy-path-feedback { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
